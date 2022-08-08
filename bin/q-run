@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+# Copyright 2022 Peter Wagener <mail@peterwagener.net>
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <https://www.gnu.org/licenses/>.
+
+"""Advanced project/system specific hotkey host"""
+import cli
+import os
+import logging
+import subprocess
+import shlex
+import threading
+import sys
+import queue
+
+cli.configureLogging()
+
+fn_work = os.path.realpath(os.getcwd())
+fn_root, fn_script = cli.findWorkdirFile(".qrun", ascend=True)
+fn_pipe = f"/run/user/{os.getuid()}/q-run.pipe"
+
+cmd_describe = cli.subcommand(
+  "describe", "print info about the (project-specific) q-run environment")
+
+cmd_host = cli.subcommand(
+  "host",
+  "listen continuously for hotkeys and execute project-specific commands")
+
+cmd_execute = cli.subcommand("execute", "queue a command")
+cmd_execute.ArgVariable(str, None, "cmd", "command to queue", True)
+
+cli.process()
+
+
+class Description:
+	def __init__(s, **commands):
+		s.commands = dict(commands)
+
+
+def getDescription() -> Description:
+	if fn_script is None or not os.path.isfile(fn_script):
+		logging.error("no viable .qrun script found")
+		return Description()
+	p = subprocess.Popen([fn_script, "describe"], stdout=subprocess.PIPE)
+
+	commands = dict()
+	for ln in p.stdout:
+		data = ln.decode().strip().split(" ", 1)
+		if len(data) != 2:
+			continue
+		commands[data[0].strip()] = data[1].strip()
+
+	return Description(**commands)
+
+
+if cmd_describe:
+	with cli.TablePrinter(firstRowHeader=False) as tbl:
+		tbl.addRow("fn_work", fn_work)
+		tbl.addRow("fn_root", fn_root)
+		tbl.addRow("fn_script", fn_script)
+
+	desc = getDescription()
+
+	with cli.TablePrinter(firstRowHeader=False, columnSeparator=': ') as tbl:
+		for ident, title in sorted(desc.commands.items()):
+			tbl.addRow(f"command {ident}", title)
+
+if cmd_host:
+	desc = getDescription()
+
+	cmdQueue = queue.Queue()
+
+	if os.path.exists(fn_pipe):
+		logging.fatal(f"fifo {fn_pipe} exists already")
+		exit(1)
+
+	def thrdf_fifo():
+
+		os.mkfifo(fn_pipe)
+
+		while True:
+			with open(fn_pipe, "r") as f:
+				cmd = f.read().strip()
+
+			cmdQueue.put(cmd)
+
+	threading.Thread(target=thrdf_fifo, daemon=True).start()
+	try:
+		while True:
+			sys.stdout.write("\n\n\r\x1b[35;1mSTA\x1b[30;0m ")
+			for cmd, title in sorted(desc.commands.items()):
+				sys.stdout.write(f"\x1b[32;1m{cmd}\x1b[30;0m:{title} ")
+			sys.stdout.write("\n")
+			sys.stdout.flush()
+
+			cmd = cmdQueue.get()
+			if not cmd in desc.commands:
+				logging.warning(f"unavailable command: {cmd}")
+
+			logging.info(f"running {cmd} on {fn_script}")
+			p = subprocess.Popen([fn_script, cmd])
+			try:
+				p.wait()
+			except KeyboardInterrupt:
+				sys.stdout.write("\r")
+				logging.info(f"killing running process")
+				p.kill()
+
+			logging.info(f"command {cmd} exit code {p.returncode}")
+	except KeyboardInterrupt:
+		pass
+	finally:
+		os.unlink(fn_pipe)
+
+if cmd_execute:
+
+	if not os.path.exists(fn_pipe):
+		logging.fatal(f"fifo {fn_pipe} does not exist")
+		exit(1)
+
+	with open(fn_pipe, "w") as f:
+		f.write(cmd_execute.cmd + "\n")

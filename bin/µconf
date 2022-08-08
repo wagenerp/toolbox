@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+# Copyright 2022 Peter Wagener <mail@peterwagener.net>
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <https://www.gnu.org/licenses/>.
+
+import pathlib
+import logging
+import re
+import os
+import shlex
+import shutil
+from collections import defaultdict
+import cli
+
+cli.configureLogging()
+
+
+class ConfigError(Exception):
+	pass
+
+
+class UserError(Exception):
+	pass
+
+
+e_config_option = re.compile(r"^(.*)\.µ\.(.*)$")
+e_variant_dir = re.compile(r"^µ.(.*)$")
+
+
+class SymlinkOption:
+	def __init__(s, fnSource: pathlib.Path, fnTarget: pathlib.Path,
+	             idVariant: str, root):
+		s.fnSource = fnSource
+		s.fnTarget = fnTarget
+		s.idVariant = str(idVariant)
+		s.root = root
+
+
+class Root:
+	def __init__(s, fn: pathlib.Path, recurse: bool):
+		s.fn = fn
+		s.recurse = recurse
+
+
+class OptionRoot:
+	def __init__(s, fnSource: pathlib.Path, fnTarget: pathlib.Path):
+		s.fnSource = fnSource
+		s.fnTarget = fnTarget
+
+	def scan(s):
+		def handleVariant(fn: pathlib.Path):
+
+			m = e_config_option.match(fn.name)
+			if not m: return
+
+			fnDir = fn.parent
+
+			fbTarget, idbVariant = m.groups()
+
+			yield SymlinkOption(fn, s.fnTarget / fbTarget,
+			                    fn.parent.relative_to(s.fnSource) / idbVariant, s)
+
+		def recurseVariantDir(fnRoot: pathlib.Path):
+			idVariant = fnRoot.parent.relative_to(s.fnSource) / fnRoot.name[2:]
+
+			for fnCurrentDir, subdirs, files in os.walk(fnRoot):
+				fnCurrentDir = pathlib.Path(fnCurrentDir)
+				for fb in files:
+					fn = fnCurrentDir / fb
+
+					yield SymlinkOption(
+					  fn, s.fnTarget / fnCurrentDir.relative_to(fnRoot) / fb, idVariant,
+					  s)
+
+		def recurse(fnRoot: pathlib.Path):
+			for fb in os.listdir(fnRoot):
+				fn = fnRoot / fb
+				if fn.is_dir():
+					if fb.startswith("µ."):
+						yield from recurseVariantDir(fn)
+					else:
+						if not handleVariant(fn):
+							yield from recurse(fn)
+				else:
+					yield from handleVariant(fn)
+
+		yield from recurse(s.fnSource)
+
+
+class Realm:
+	def __init__(s):
+		s.optionRoots = list()
+		s.options = list()
+		s.targets = set()
+		s.variants = set()
+
+		s.fnRoot = pathlib.Path()
+
+	def initFromDirectory(s, fnStart: pathlib.Path):
+
+		for fn in (fnStart / "foo").parents:
+			fnConfig = fn / ".µconf"
+			if fnConfig.exists():
+				s.fnRoot = fn
+				s.loadConfig(fnConfig)
+				break
+		else:
+			raise UserError(f"not a µconf directory: {fnStart}")
+
+	def loadConfig(s, fnConfig: pathlib.Path):
+		with fnConfig.open("r") as f:
+			lidx = 0
+			legacyOptionPath = None
+			legacyRoot = None
+			legacyRecurse = False
+
+			for ln in f:
+				lidx += 1
+				args = shlex.split(ln, comments=True)
+				if len(args) < 1: continue
+
+				cmd, args = args[0], args[1:]
+				try:
+					if cmd == "root":
+						for arg in args:
+							if legacyRoot is None:
+								legacyRoot = pathlib.Path(arg)
+							else:
+								raise ConfigError("multiple paths")
+						if legacyRoot is None:
+							raise ConfigError("no path given")
+
+					elif cmd == "recurse":
+						legacyRecurse = True
+					elif cmd == "option-path":
+						for arg in args:
+							if legacyOptionPath is None:
+								legacyOptionPath = pathlib.Path(arg)
+							else:
+								raise ConfigError("multiple paths")
+
+						if legacyOptionPath is None:
+							raise ConfigError("no path given")
+					elif cmd == "options":
+						fnSource = None
+						fnTarget = None
+						for arg in args:
+							if fnSource is None:
+								fnSource = arg
+							elif fnTarget is None:
+								fnTarget = arg
+							else:
+								raise ConfigError(f"stray argument: {arg}")
+						if fnTarget is None:
+							raise ConfigError("missing source / target paths")
+						fnSourceBase = fnSource
+						fnTargetBase = fnTarget
+						fnSource = fnConfig.parent / fnSource
+						fnTarget = fnConfig.parent / fnTarget
+
+						if not fnSource.exists() or not fnSource.is_dir():
+							raise ConfigError(
+							  f"not an existing directory path: {fnSourceBase}")
+
+						if not fnTarget.exists() or not fnTarget.is_dir():
+							raise ConfigError(
+							  f"not an existing directory path: {fnTargetBase}")
+						s.optionRoots.append(OptionRoot(fnSource, fnTarget))
+					else:
+						raise ConfigError("unrecognized command")
+
+				except ConfigError as e:
+					logging.warning(f"invalid '{cmd}' command in {fnConfig}:{lidx}: {e}")
+
+			try:
+				if legacyOptionPath is not None and legacyRoot is not None:
+
+					legacyRoot = fnConfig.parent / legacyRoot
+					legacyOptionPath = legacyRoot / legacyOptionPath
+
+					if not legacyRoot.exists() or not legacyRoot.is_dir():
+						raise ConfigError(f"not an existing directory path: {legacyRoot}")
+
+					if not legacyOptionPath.exists() or not legacyOptionPath.is_dir():
+						raise ConfigError(
+						  f"not an existing directory path: {legacyOptionPath}")
+
+					s.optionRoots.append(OptionRoot(legacyOptionPath, legacyRoot))
+			except ConfigError as e:
+				logging.warning(f"invalid config {fnConfig}: {e}")
+
+	def scan(s):
+		s.options.clear()
+
+		for root in s.optionRoots:
+			for option in root.scan():
+				s.options.append(option)
+
+		s.targets = set(v.fnTarget for v in s.options)
+		s.variants = set(v.idVariant for v in s.options)
+
+		s.sources = {v.fnSource: v for v in s.options}
+
+
+realm = None
+
+
+def getRealm():
+	global realm
+	if realm is None:
+		realm = Realm()
+		realm.initFromDirectory(pathlib.Path(os.getcwd()))
+		realm.scan()
+
+	return realm
+
+
+def existing_variant_t(v: str):
+	if v not in getRealm().variants:
+		raise ValueError(v)
+	return v
+
+
+def variant_t(v: str):
+	return v
+
+
+def existing_variant_options():
+	return tuple(str(v) for v in sorted(getRealm().variants))
+
+
+existing_variant_t.options = existing_variant_options
+variant_t.options = existing_variant_options
+
+fForce = cli.Flag(
+  "f", "force",
+  "Overwrite existing files/links even if they do not point to µconf files")
+
+cmdDuplicate = cli.subcommand("duplicate")
+cmdView = cli.subcommand("view")
+cmdApply = cli.subcommand("apply")
+cmdRemove = cli.subcommand("remove")
+
+cmdDuplicateFrom = cmdDuplicate.ArgVariable(existing_variant_t,
+                                            None,
+                                            "original",
+                                            "name of the original variant",
+                                            required=True)
+cmdDuplicateTo = cmdDuplicate.ArgVariable(variant_t,
+                                          None,
+                                          "duplicate",
+                                          description="name of the new variant",
+                                          required=True)
+
+cmdViewVariant = cmdView.ArgVariable(variant_t, None, "variant",
+                                     "name of the variant to view")
+cmdViewAll = cmdView.Flag("a", "all", "view all source files too")
+cmdRemoveVariant = cmdRemove.ArgVariable(existing_variant_t,
+                                         None,
+                                         "variant",
+                                         "name of the variant to remove",
+                                         required=True)
+
+cmdApplyVariant = cmdApply.ArgVariable(variant_t, None, "variant",
+                                       "name of the variant to view")
+
+
+@cli.check
+def _():
+	if not (cmdDuplicate or cmdView or cmdApply or cmdRemove):
+		raise cli.clex("missing subcommand")
+
+
+cli.process()
+
+if cmdView:
+	realm = getRealm()
+	if cmdViewVariant.value is not None:
+		for option in sorted(
+		  (v for v in realm.options if v.idVariant == cmdViewVariant.value),
+		  key=lambda v: v.fnSource):
+			print(
+			  f"  {v.fnSource.relative_to(realm.fnRoot)} -> {v.fnTarget.relative_to(realm.fnRoot)}"
+			)
+	else:
+		variant_options = defaultdict(lambda: (set(), set()))
+		realm = getRealm()
+		non_links = list()
+		bad_targets = list()
+		non_existing = list()
+		for fnTarget in realm.targets:
+
+			if not fnTarget.is_symlink():
+				if not fnTarget.exists():
+					non_existing.append(fnTarget)
+				else:
+					non_links.append(fnTarget)
+				continue
+
+			if not fnTarget.exists():
+				bad_targets.append(fnTarget)
+				continue
+
+			fnSource = fnTarget.resolve()
+			if not fnSource.exists() or fnSource not in realm.sources:
+				bad_targets.append(fnTarget)
+				continue
+
+			variant_options[realm.sources[fnSource].idVariant][0].add(
+			  realm.sources[fnSource])
+
+		for title, members in (
+		  ("targets being non-symlinks", non_links),
+		  ("links pointing to non-sources", bad_targets),
+		  ("missing targets", non_existing),
+		):
+			if len(members) < 1: continue
+
+			print(f"\x1b[31;1m{title}\x1b[30;0m:")
+			for fn in sorted(members):
+				if fn.is_symlink():
+					print(f"  {fn.relative_to(realm.fnRoot)} -> {os.readlink(fn)}")
+				else:
+					print(f"  {fn.relative_to(realm.fnRoot)}")
+
+				supplying = set(
+				  v.idVariant for v in realm.options if v.fnTarget == fnTarget)
+				print(
+				  f"    supplied by {len(supplying)}/{len(realm.variants)}: {', '.join(str(v) for v in sorted(supplying))}"
+				)
+
+		if cmdViewAll:
+			for opt in realm.options:
+				variant_options[opt.idVariant][1].add(opt)
+
+		for idVariant, (options_active, options_all) in sorted(
+		  variant_options.items()):
+			print(idVariant)
+			options_all.update(options_active)
+			for v in sorted(options_all, key=lambda o: (o.fnTarget)):
+				cl = "\x1b[30;0m" if v in options_active else "\x1b[38;5;247m"
+				print(
+				  f"  {cl}{v.fnSource.relative_to(realm.fnRoot)} -> {v.fnTarget.relative_to(realm.fnRoot)}\x1b[30;0m"
+				)
+
+if cmdDuplicate:
+	realm = getRealm()
+
+	for opt in realm.options:
+		if opt.idVariant != cmdDuplicateFrom.value: continue
+
+		fnSourceRel = opt.fnSource.relative_to(opt.root.fnSource)
+
+		for i, part in enumerate(fnSourceRel.parts):
+			if e_variant_dir.match(part):
+				newParts = fnSourceRel.parts[:i] + (
+				  f"µ.{cmdDuplicateTo.value}", ) + fnSourceRel.parts[i + 1:]
+				fnNewSourceRel = pathlib.Path(*newParts)
+				break
+		else:
+			m = e_config_option.match(fnSourceRel.name)
+			if not m:
+				logging.warning(
+				  f"unexpected format of source file {opt.fnSource.relativeTo(realm.fnRoot)} - cannot duplicate"
+				)
+				continue
+			fnNewSourceRel = fnSourceRel.parent / f"{m.groups()[0]}.µ.{cmdDuplicateTo.value}"
+
+		fnNewSource = opt.root.fnSource / fnNewSourceRel
+		logging.info(
+		  f"copying {opt.fnSource.relative_to(realm.fnRoot)} -> {fnNewSource.relative_to(realm.fnRoot)}"
+		)
+
+		os.makedirs(fnNewSource.parent, exist_ok=True)
+		if opt.fnSource.is_dir():
+			shutil.copytree(opt.fnSource, fnNewSource)
+		else:
+			shutil.copy(opt.fnSource, fnNewSource)
+
+if cmdApply:
+
+	realm = getRealm()
+
+	def exec(test):
+		success = True
+		for fnTarget in realm.targets:
+
+			if not fnTarget.is_symlink():
+				if not fnTarget.exists():
+					continue
+				else:
+					logging.warning(
+					  f"{fnTarget.relative_to(realm.fnRoot)} is not handled by µconf")
+					if test:
+						success = False
+						continue
+			elif not fnTarget.exists() or fnTarget.resolve() not in realm.sources:
+				logging.warning(
+				  f"{fnTarget.relative_to(realm.fnRoot)} is not handled by µconf")
+				if test:
+					success = False
+					continue
+
+			if not test:
+				logging.info(f"unlinking {fnTarget.relative_to(realm.fnRoot)}")
+				os.unlink(fnTarget)
+
+		return success
+
+	if not fForce.value:
+
+		if not exec(test=True):
+			logging.error("Unclean configuration - use -f to override")
+			exit(1)
+
+	exec(test=False)
+
+	for opt in realm.options:
+		if opt.idVariant != cmdApplyVariant.value: continue
+
+		logging.info(
+		  f"linking {opt.fnSource.relative_to(opt.root.fnSource)} -> {opt.fnTarget.relative_to(opt.root.fnTarget)}"
+		)
+		os.symlink(os.path.relpath(opt.fnSource, opt.fnTarget.parent), opt.fnTarget)
+
+if cmdRemove:
+
+	realm = getRealm()
+
+	deletion_items = set()
+
+	for opt in realm.options:
+		if opt.idVariant != cmdRemoveVariant.value: continue
+
+		fnSourceRel = opt.fnSource.relative_to(opt.root.fnSource)
+
+		for i, part in enumerate(fnSourceRel.parts):
+			if e_variant_dir.match(part):
+				fnVariantDir = opt.root.fnSource / pathlib.Path(*fnSourceRel.parts[:i +
+				                                                                   1])
+				if fnVariantDir not in deletion_items:
+					logging.info(
+					  f"removing variant directory {fnVariantDir.relative_to(realm.fnRoot)}"
+					)
+					deletion_items.add(fnVariantDir)
+				break
+		else:
+			logging.info(
+			  f"removing variant option {opt.fnSource.relative_to(realm.fnRoot)}")
+			deletion_items.add(opt.fnSource)
+
+	for fn in deletion_items:
+		if fn.is_dir():
+			shutil.rmtree(fn)
+		else:
+			os.unlink(fn)

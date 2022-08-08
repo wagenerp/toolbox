@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+# Copyright 2022 Peter Wagener <mail@peterwagener.net>
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <https://www.gnu.org/licenses/>.
+
+import sys, os, traceback, re
+
+
+def nice_format(str,
+                indents=0,
+                newline="\n",
+                split_suffix='\\',
+                split_prefix='',
+                maxcols=80,
+                splitafter=list(" \t(){}=+-")):
+
+	if indents + len(split_suffix) + len(split_prefix) >= maxcols:
+		raise Exception("indent count must not exceed column limit")
+
+	indent = " " * indents
+	res = indent
+	cols = indents
+	while len(str) > 0:
+		if len(str) + cols < maxcols:
+			res += str
+			break
+
+		i0 = maxcols - cols - len(split_suffix) - 1
+		for i in range(i0, i0 // 2, -1):
+			if str[i] in splitafter:
+				res += str[:i + 1] + split_suffix + "\n" + indent + split_prefix
+				str = str[i + 1:]
+				cols = indents + len(split_prefix)
+				break
+		else:
+			res += str[:i0] + split_suffix + "\n" + indent + split_prefix
+			str = str[i0:]
+
+	return res
+
+
+class LanguageProcessor:
+	LINE_SOURCE = 1
+	LINE_METAFORMAT = 2
+	LINE_METACODE = 3
+	LINE_IGNORE = 4
+
+	def __init__(s, env=None, do_write=True):
+		if env == None: s.env = {}
+		else: s.env = env
+
+		s.do_write = do_write
+		pass
+
+	def process_file(s, fn, tabSize=2):
+		s.output = ""
+		s.code = ""
+		s.file_path = os.path.dirname(fn)
+		s.block_indents = 0
+		s.tabSize = 2
+
+		path_default = list(sys.path)
+		cwd = os.getcwd()
+		os.chdir(s.file_path)
+
+		sys.path.append(s.file_path)
+
+		s.current_line = 1
+		s.set_first_code_line = True
+		s.first_code_line = 1
+
+		s.locals = {}
+		s.globals = {}
+
+		s.globals.update(s.env)
+
+		s.globals["this"] = s
+
+		write = s.do_write
+		try:
+			with open(fn, "r") as f:
+				for ln in f:
+					s.process_line(ln)
+					s.current_line = s.current_line + 1
+		except Exception as e:
+
+			print("Target exception %s traceback:" % e)
+			tb = traceback.extract_tb(sys.exc_info()[2])
+			for v in tb:
+				if v[3] == None:
+					v = (fn, s.first_code_line + v[1] - 1,
+					     '<target>' if v[2] == "<module>" else v[2], None)
+				print(traceback.format_list([v])[0])
+			write = False
+
+		if write:
+			with open(fn, "w") as f:
+				f.write(s.output)
+
+		sys.path = path_default
+		os.chdir(cwd)
+		s.locals = None
+		s.globals = None
+
+	def print(s, str, ensure_newline=False):
+		if ensure_newline and not (s.output[-1] in ['\r', '\n']):
+			s.output += "\n"
+		s.output += str
+
+	def printn(s,
+	           str,
+	           ensure_newline=False,
+	           suffix='\\',
+	           prefix='',
+	           cols=80,
+	           splitafter=list(" \t(){}=+-")):
+		if ensure_newline and not (s.output[-1] in ['\r', '\n']):
+			s.output += "\n"
+		s.output += nice_format(str,
+		                        indents=s.block_indents,
+		                        split_suffix=suffix,
+		                        split_prefix=prefix,
+		                        maxcols=cols,
+		                        splitafter=splitafter)
+
+	def add_code(s, code):
+		s.code = s.code + code
+		if s.set_first_code_line:
+			s.set_first_code_line = False
+			s.first_code_line = s.current_line
+
+	def clear_code(s):
+		s.code = ""
+		s.set_first_code_line = True
+
+	def run_code(s):
+		global this, path
+		this = s
+		path = s.file_path
+		exec(s.code, s.globals)
+		s.code = ""
+		s.set_first_code_line = True
+
+	def process_line(s, ln):
+		s.print(ln)
+		return True
+
+
+class LineCommentProcessor(LanguageProcessor):
+	STATE_SOURCE = 1
+	STATE_METACODE = 101
+	STATE_WAIT_DONE = 102
+
+	def __init__(s, **args):
+		super(LineCommentProcessor, s).__init__(**args)
+
+	def process_file(s, fn):
+		s.state = LineCommentProcessor.STATE_SOURCE
+
+		LanguageProcessor.process_file(s, fn)
+
+		s.state = None
+
+	def process_line(s, ln):
+		lns = ln.strip()
+		if s.state == LineCommentProcessor.STATE_SOURCE:
+			if lns == s.token_begin_line:
+				s.state = LineCommentProcessor.STATE_METACODE
+		elif s.state == LineCommentProcessor.STATE_METACODE:
+			if lns == s.token_end_line:
+				s.state = LineCommentProcessor.STATE_SOURCE
+				s.run_code()
+
+			elif lns.startswith(s.token_prefix_line):
+				j = 0
+				s.block_indents = 0
+				while j < len(ln) and ln[j] in [' ', '\t']:
+					j = j + 1
+					s.block_indents += 1 if ln[j] == ' ' else 2
+				s.add_code(lns[2:] + "\n")
+			else:
+				ln = None
+				s.state = LineCommentProcessor.STATE_WAIT_DONE
+		elif s.state == LineCommentProcessor.STATE_WAIT_DONE:
+			if lns == s.token_end_line:
+				s.state = LineCommentProcessor.STATE_SOURCE
+				s.run_code()
+			else:
+				ln = None
+		else:
+			ln = None
+
+		if ln != None:
+			s.print(ln)
+			return True
+
+		return False
+
+
+class BlockCommentProcessor(LanguageProcessor):
+	STATE_SOURCE = 1
+	STATE_METACODE_FIRST = 201
+	STATE_METACODE = 202
+	STATE_OUTPUT = 203
+
+	def __init__(s, **args):
+		super(BlockCommentProcessor, s).__init__(**args)
+
+	def process_file(s, fn):
+		s.state = BlockCommentProcessor.STATE_SOURCE
+
+		LanguageProcessor.process_file(s, fn)
+
+		s.state = None
+
+	def process_line(s, ln, process_default=False):
+		ln = ln.replace("\t", "  ")
+		lns = ln.strip()
+
+		if s.state == BlockCommentProcessor.STATE_SOURCE:
+			if lns == s.token_begin_block:
+				s.state = BlockCommentProcessor.STATE_METACODE_FIRST
+			if not process_default:
+				ln = None
+		elif s.state == BlockCommentProcessor.STATE_METACODE_FIRST:
+
+			if len(ln) < 1:
+				s.token_prefix_block = ""
+			else:
+				j = 0
+				s.block_indents = 0
+				while j < len(ln) and ln[j] in [' ', '\t']:
+					s.block_indents += 1 if ln[j] == ' ' else 2
+					j = j + 1
+				s.token_prefix_block = ln[:j]
+			s.add_code(lns + "\n")
+			s.state = BlockCommentProcessor.STATE_METACODE
+
+		elif s.state == BlockCommentProcessor.STATE_METACODE:
+			if lns == s.token_output_block:
+				s.state = BlockCommentProcessor.STATE_OUTPUT
+			elif lns == s.token_end_block:
+				s.state = BlockCommentProcessor.STATE_SOURCE
+				s.clear_code()
+			elif ln.startswith(s.token_prefix_block):
+				s.add_code(ln[len(s.token_prefix_block):])
+
+		elif s.state == BlockCommentProcessor.STATE_OUTPUT:
+			if lns == s.token_end_block:
+				s.run_code()
+				s.print(ln, True)
+				ln = None
+				s.state = BlockCommentProcessor.STATE_SOURCE
+			else:
+				ln = None
+		else:
+			ln = None
+
+		if ln != None:
+			s.print(ln)
+			return True
+
+		return False
+
+
+class MixedProcessor(LineCommentProcessor, BlockCommentProcessor):
+	def __init__(s, **args):
+		super(MixedProcessor, s).__init__(**args)
+
+	def process_file(s, fn):
+		s.state = LineCommentProcessor.STATE_SOURCE
+
+		LanguageProcessor.process_file(s, fn)
+
+		s.state = None
+
+	def process_line(s, ln):
+		LineCommentProcessor.process_line(s, ln)
+		BlockCommentProcessor.process_line(s, ln, process_default=False)
+
+
+class VHDLProcessor(LineCommentProcessor):
+
+	instance = None
+	identifier = "-- processor: VHDL"
+
+	def __init__(s, **args):
+		super(VHDLProcessor, s).__init__(**args)
+		s.token_begin_line = "--v py"
+		s.token_end_line = "--^ py"
+		s.token_prefix_line = "--"
+
+
+class HashHashProcessor(LineCommentProcessor):
+
+	instance = None
+	identifier = "## processor: ##"
+
+	def __init__(s, **args):
+		super(HashHashProcessor, s).__init__(**args)
+		s.token_begin_line = "##v py"
+		s.token_end_line = "##^ py"
+		s.token_prefix_line = "##"
+
+
+class CLikeProcessor(MixedProcessor):
+
+	instance = None
+	identifier = "-- processor: C"
+
+	def __init__(s, **args):
+		super(CLikeProcessor, s).__init__(**args)
+		s.token_begin_line = "//v py"
+		s.token_end_line = "//^ py"
+		s.token_prefix_line = "//"
+		s.token_begin_block = "/*v py"
+		s.token_output_block = "! output*/"
+		s.token_end_block = "//^ py"
+
+
+class DLikeProcessor(MixedProcessor):
+
+	instance = None
+	identifier = "// processor: D"
+
+	def __init__(s, **args):
+		super(DLikeProcessor, s).__init__(**args)
+		s.token_begin_line = "//v py"
+		s.token_end_line = "//^ py"
+		s.token_prefix_line = "//"
+		s.token_begin_block = "/+v py"
+		s.token_output_block = "! output+/"
+		s.token_end_block = "//^ py"
+
+
+class LuaProcessor(MixedProcessor):
+
+	instance = None
+	identifier = "-- processor: lua"
+
+	def __init__(s, **args):
+		super(LuaProcessor, s).__init__(**args)
+		s.token_begin_line = "--v py"
+		s.token_end_line = "--^ py"
+		s.token_prefix_line = "--"
+		s.token_begin_block = "--[[v py"
+		s.token_output_block = "! output--]]"
+		s.token_end_block = "--^ py"
+
+
+extmap = {
+  ".vhd": VHDLProcessor,
+  ".pao": HashHashProcessor,
+  ".c": CLikeProcessor,
+  ".cpp": CLikeProcessor,
+  ".hc": CLikeProcessor,
+  ".h": CLikeProcessor,
+  ".hpp": CLikeProcessor,
+  ".d": DLikeProcessor,
+  ".java": CLikeProcessor,
+  ".lua": LuaProcessor,
+  "makefile": HashHashProcessor,
+  ".py": HashHashProcessor,
+  ".mako": HashHashProcessor,
+}
+
+processors = [
+  VHDLProcessor, CLikeProcessor, DLikeProcessor, LuaProcessor, HashHashProcessor
+]
+identifiers = {v.identifier: v for v in processors if hasattr(v, "identifier")}
+
+if __name__ == "__main__":
+	i = 1
+	set_type = None
+	while i < len(sys.argv):
+		arg = sys.argv[i]
+		i = i + 1
+		if arg == "-t":
+			set_type = sys.argv[i + 1]
+			i = i + 1
+		else:
+			reset_type = False
+			if set_type is None:
+				reset_type = True
+				(basename, set_type) = os.path.splitext(arg)
+				basename = os.path.basename(arg)
+				if basename == "Makefile":
+					set_type = "makefile"
+
+				fb = os.path.split(arg)[1]
+				m = re.match("^.*?([.][^.]+)[.]µ[.].*$", fb)
+				if m:
+					set_type = m.groups()[0]
+			set_type = set_type.lower()
+			lpt = None
+			if not set_type in extmap:
+				with open(arg) as f:
+					first = True
+					for ln in f:
+						lns = ln.strip()
+						if lns in identifiers:
+							lpt = identifiers[lns]
+							break
+
+						if not first or ln[:1] != "#":
+							break
+						first = False
+				if lpt is None:
+					print(
+					  "WARNING: no language processor available for type '%s'" % set_type)
+					exit(1)
+			else:
+				lpt = extmap[set_type]
+			if lpt.instance == None:
+				lpt.instance = lpt()
+			print("processing %s" % arg)
+			lpt.instance.process_file(os.path.realpath(arg))
